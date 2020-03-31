@@ -27,7 +27,7 @@ def find_token_indices(rodata, endianness):
         # Therefore, look for 1+2 consecutive zeroes.
         token_index_offset = rodata.find(
             b'\x00\x00\x00', token_index_offset) + 1
-        if token_index_offset == 0:
+        if token_index_offset == 0 or token_index_offset + 512 > len(rodata):
             break
         token_index = try_parse_token_index(
             rodata, endianness, token_index_offset)
@@ -180,14 +180,18 @@ def find_num_syms(rodata, endianness, token_table, markers_offset):
             # kallsyms_num_syms value, which is consistent with the number of
             # name entries we've seen so far.
             name_counts.append(next_name_count + 1)
-            num_syms1, = struct.unpack(num_syms_fmt, rodata[offset - 4:offset])
-            if name_counts[-1] == num_syms1:
-                num_syms_offset = offset - 4
-                break
-            num_syms2, = struct.unpack(
-                num_syms_fmt, rodata[offset - 8:offset - 4])
-            if name_counts[-1] == num_syms2:
-                num_syms_offset = offset - 8
+            num_syms_offset = None
+            # How kallsyms_num_syms is aligned depends on a particular kernel,
+            # so try different offsets.
+            for i in (-4, -8, -12, -16):
+                num_syms, = struct.unpack(
+                    num_syms_fmt, rodata[offset + i:offset + i + 4])
+                if name_counts[-1] == num_syms:
+                    num_syms_offset = offset + i
+                    break
+                if num_syms != 0:
+                    break
+            if num_syms_offset is not None:
                 break
         else:
             # The current name entry is not valid. This is allowed if we are
@@ -204,8 +208,8 @@ def find_num_syms(rodata, endianness, token_table, markers_offset):
 
 
 def get_addresses(rodata, endianness, num_syms_offset, num_syms):
-    # Right now this function understands just one format: non-percpu
-    # kallsyms_offsets followed by kallsyms_relative_base.
+    # This function supports only KALLSYMS_BASE_RELATIVE: kallsyms_offsets
+    # followed by kallsyms_relative_base.
     address_fmt = endianness + 'i'
     kallsyms_relative_base, = struct.unpack(
         endianness + 'Q', rodata[num_syms_offset - 8:num_syms_offset])
@@ -213,14 +217,29 @@ def get_addresses(rodata, endianness, num_syms_offset, num_syms):
     if addresses_offset % 8 != 0:
         addresses_offset -= 4
     offset = addresses_offset
-    addresses = []
+    raw_addresses = []
     for _ in range(num_syms):
         raw, = struct.unpack(address_fmt, rodata[offset:offset + 4])
-        if raw >= 0:
-            addresses.append(raw)
-        else:
-            addresses.append(kallsyms_relative_base - 1 - raw)
+        raw_addresses.append(raw)
         offset += 4
+    # Try KALLSYMS_ABSOLUTE_PERCPU.
+    addresses = []
+    for raw in raw_addresses:
+        if raw >= 0:
+            address = raw
+        else:
+            address = kallsyms_relative_base - 1 - raw
+        if len(addresses) > 0 and address < addresses[-1]:
+            # The resulting addresses are not sorted.
+            break
+        addresses.append(address)
+    else:
+        return addresses_offset, addresses
+    # Assume !KALLSYMS_ABSOLUTE_PERCPU.
+    addresses = [
+        kallsyms_relative_base + raw & 0xffffffff
+        for raw in raw_addresses
+    ]
     return addresses_offset, addresses
 
 
