@@ -1,0 +1,401 @@
+#!/usr/bin/env pypy3
+import argparse
+from contextlib import contextmanager
+import io
+import json
+import logging
+from multiprocessing import cpu_count
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+from typing import Any, Dict, Generator, List, NamedTuple, Optional, Tuple
+
+from elftools.elf.elffile import ELFFile  # type: ignore
+from kconfiglib import Kconfig  # type: ignore
+
+from find_kallsyms import find_kallsyms_in_rodata
+
+
+def get_elf_host(header: Any) -> str:
+    return {
+        ('EM_386', 'ELFCLASS32', 'ELFDATA2LSB'): 'i686-linux-gnu',
+        ('EM_MIPS', 'ELFCLASS32', 'ELFDATA2MSB'): 'mips-linux-gnu',
+        ('EM_PPC', 'ELFCLASS32', 'ELFDATA2MSB'): 'powerpc-linux-gnu',
+        ('EM_PPC64', 'ELFCLASS64', 'ELFDATA2MSB'): 'powerpc64-linux-gnu',
+        ('EM_S390', 'ELFCLASS64', 'ELFDATA2MSB'): 's390x-linux-gnu',
+        ('EM_ARM', 'ELFCLASS32', 'ELFDATA2LSB'): 'arm-linux-gnueabi',
+        ('EM_X86_64', 'ELFCLASS64', 'ELFDATA2LSB'): 'x86_64-linux-gnu',
+        ('EM_AARCH64', 'ELFCLASS64', 'ELFDATA2LSB'): 'aarch64-linux-gnu',
+    }[header.e_machine, header.e_ident.EI_CLASS, header.e_ident.EI_DATA]
+
+
+def get_linux_arch(host: str) -> str:
+    return {
+        'i686': 'i386',
+        'mips': 'mips',
+        'powerpc': 'ppc',
+        'powerpc64': 'ppc64',
+        's390x': 's390x',
+        'arm': 'arm',
+        'x86_64': 'x86_64',
+        'aarch64': 'arm64',
+    }[host[:host.index('-')]]
+
+
+def arch2srcarch(arch: str) -> str:
+    if arch in ('i386', 'x86_64'):
+        return 'x86'
+    return arch
+
+
+def fetch_tag(git: Path, remote: str, tag: str) -> None:
+    git.mkdir(parents=True, exist_ok=True)
+    subprocess.check_call(['git', 'init'], cwd=git)
+    subprocess.check_call(['git', 'fetch', remote, f'{tag}:{tag}'], cwd=git)
+
+
+def prepare_worktree(worktree: Path, git: Path, remote: str, tag: str) -> None:
+    fetch_tag(git, remote, tag)
+    try:
+        shutil.rmtree(worktree)
+    except FileNotFoundError:
+        pass
+    subprocess.check_call(
+        ['git', 'worktree', 'add', '-f', '--detach', worktree, tag], cwd=git)
+
+
+def build_or_reuse_toolchain(
+        binutils_git: Path,
+        binutils_version: Optional[str],
+        gcc_git: Path,
+        gcc_version: str,
+        host: str,
+) -> Path:
+    gcc = f'{host}-gcc-{gcc_version}'
+    install = Path.cwd() / gcc
+    bin = install / 'bin'
+    if (bin / gcc).exists():
+        return bin
+    worktree = Path.cwd() / f'{gcc}-build'
+    prepare_worktree(
+        worktree=worktree,
+        git=gcc_git,
+        remote='git://gcc.gnu.org/git/gcc.git',
+        tag=f'refs/tags/releases/gcc-{gcc_version}',
+    )
+    if binutils_version is None:
+        binutils_version = '2.27'
+    binutils_tag = 'refs/tags/binutils-' + binutils_version.replace('.', '_')
+    fetch_tag(
+        git=binutils_git,
+        remote='git://sourceware.org/git/binutils-gdb.git',
+        tag=binutils_tag,
+    )
+    p = subprocess.Popen(
+        args=['git', 'archive', binutils_tag],
+        stdout=subprocess.PIPE,
+        cwd=binutils_git,
+    )
+    subprocess.check_call(
+        args=['tar', '--skip-old-files', '-x'],
+        stdin=p.stdout,
+        cwd=worktree,
+    )
+    if p.wait() != 0:
+        raise subprocess.CalledProcessError(p.returncode, p.args)
+    subprocess.check_call([
+        './configure',
+        f'--target={host}',
+        '--enable-languages=c',
+        '--disable-bootstrap',
+        '--disable-multilib',
+        '--disable-nls',
+        f'--prefix={install}',
+    ], cwd=worktree, env={**os.environ, 'CXXFLAGS': '-fpermissive'})
+
+    def make(args: List[str]) -> None:
+        args = ['make', f'-j{cpu_count()}'] + args
+        subprocess.check_call(args, cwd=worktree)
+
+    make(['all-gcc'])
+    make([
+        'install-binutils',
+        'install-gas',
+        'install-gcc',
+        'install-ld',
+    ])
+    shutil.rmtree(worktree)
+    return bin
+
+
+def putenv(name: str, value: Optional[str]) -> None:
+    if value is None:
+        try:
+            del os.environ[name]
+        except KeyError:
+            pass
+    else:
+        os.environ[name] = value
+
+
+@contextmanager
+def env(tmp_env: Dict[str, str]) -> Generator[None, None, None]:
+    orig_env = {
+        k: os.environ.get(k)
+        for k in tmp_env.values()
+    }
+    try:
+        os.environ.update(tmp_env)
+        yield
+    finally:
+        for k, v in orig_env.items():
+            putenv(k, v)
+
+
+def cc_version_text(exe):
+    p = subprocess.Popen(
+        [exe, '--version'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        return p.stdout.readline().decode().strip()
+    finally:
+        while p.stdout.read(8192) != b'':
+            pass
+        if p.wait() != 0:
+            raise subprocess.CalledProcessError(p.returncode, p.args)
+
+
+def build_or_reuse_vmlinux(
+        output: Optional[Path],
+        git: Path,
+        host: str,
+        version: str,
+        linux_config: Optional[Path],
+        toolchain_bin: Path
+) -> Path:
+    arch = get_linux_arch(host)
+    srcarch = arch2srcarch(arch)
+    if output is None:
+        output = Path(f'vmlinux-{arch}-{version}')
+    if output.exists():
+        return output
+    worktree = Path.cwd() / f'{arch}-linux-{version}-build'
+    prepare_worktree(
+        worktree=worktree,
+        git=git,
+        remote='git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git',  # noqa: E501
+        tag=f'refs/tags/v{version}',
+    )
+    try:
+        subprocess.call(
+            args=['ccache', '--version'],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        ccache = ''
+    else:
+        ccache = 'ccache '
+    env_path = str(toolchain_bin) + os.pathsep + os.environ['PATH']
+
+    def make(args: List[str]) -> None:
+        args = [
+                   'make',
+                   f'ARCH={arch}',
+                   f'CROSS_COMPILE={ccache}{host}-',
+                   f'-j{cpu_count()}',
+               ] + args
+        subprocess.check_call(
+            args, cwd=worktree, env={**os.environ, 'PATH': env_path})
+
+    worktree_config = worktree / '.config'
+    if linux_config is None:
+        make(['defconfig'])
+        cc = f'{host}-gcc'
+        with env({
+            'srctree': str(worktree),
+            'ARCH': arch,
+            'SRCARCH': srcarch,
+            'KERNELVERSION': version,
+            'CC': cc,
+            'HOSTCC': 'gcc',
+            'HOSTCXX': 'g++',
+            'CC_VERSION_TEXT': cc_version_text(toolchain_bin / cc),
+            'PATH': env_path,
+        }):
+            kconf = Kconfig()
+            kconf.load_config(worktree_config)
+            kconf.syms['DEBUG_INFO'].set_value('y')
+            kconf.write_config(worktree_config)
+    else:
+        shutil.copyfile(linux_config, worktree_config)
+    make(['vmlinux'])
+    with tempfile.TemporaryDirectory(dir=output.parent) as tempdir:
+        vmlinux_tmp = Path(tempdir) / 'vmlinux'
+        vmlinux_tmp.symlink_to(worktree / 'vmlinux')
+        vmlinux_tmp.rename(output)
+    return output
+
+
+class Parameter(NamedTuple):
+    type: int
+    name: str
+
+
+class Subprogram(NamedTuple):
+    return_type: Optional[int]
+    name: str
+    parameters: List[Parameter]
+    has_varargs: bool
+
+
+def extract_debug_info(
+        output: Path, vmlinux: Path, kallsyms: List[str]) -> None:
+    # Mostly copied from
+    # https://github.com/mephi42/linetrace-cmd-record/blob/9769e9505cb2/linetrace-cmd-record#L179
+    # https://github.com/mephi42/linetrace-cmd-record/blob/9769e9505cb2/linetrace-cmd-record#L59
+    kallsyms_set = {kallsym[1:] for kallsym in kallsyms}
+    subprograms = {}
+    with open(vmlinux, 'rb') as fp:
+        elf = ELFFile(fp)
+        dwarf = elf.get_dwarf_info(
+            relocate_dwarf_sections=elf['e_type'] == 'ET_REL')
+        for cu in dwarf.iter_CUs():
+            for die1 in cu.get_top_DIE().iter_children():
+                if die1.tag != 'DW_TAG_subprogram':
+                    continue
+                if ('DW_AT_inline' in die1.attributes or
+                        'DW_AT_declaration' in die1.attributes):
+                    continue
+                name = die1.attributes.get('DW_AT_name')
+                if name is not None:
+                    name = name.value.decode()
+                if name is None or name not in kallsyms_set:
+                    continue
+                parameters = []
+                has_varargs = False
+                for die2 in die1.iter_children():
+                    if die2.tag == 'DW_TAG_unspecified_parameters':
+                        has_varargs = True
+                        continue
+                    if die2.tag != 'DW_TAG_formal_parameter':
+                        continue
+                    parameters.append(Parameter(
+                        type=die2.attributes['DW_AT_type'].value,
+                        name=die2.attributes['DW_AT_name'].value.decode(),
+                    ))
+                return_type = die2.attributes.get('DW_AT_type')
+                if return_type is not None:
+                    return_type = return_type.value
+                subprograms[die1.offset] = Subprogram(
+                    return_type=return_type,
+                    name=name,
+                    parameters=parameters,
+                    has_varargs=has_varargs,
+                )
+    with open(output, 'w') as output_fp:
+        json.dump({
+            'subprograms': subprograms,
+        }, output_fp, indent=4, separators=(',', ': '))
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(relativeCreated)7dms| %(message)s',
+    )
+    parser = argparse.ArgumentParser(description='Build Linux Kernel')
+    parser.add_argument(
+        '--like', help='Use an existing vmlinux as a template')
+    parser.add_argument(
+        '--host', help='Build for a specific architecture')
+    parser.add_argument(
+        '--binutils-git',
+        default='binutils-gdb',
+        help='Local Binutils git repo',
+    )
+    parser.add_argument(
+        '--binutils-version', help='Use a specific Binutils version')
+    parser.add_argument(
+        '--gcc-git', default='gcc', help='Local GCC git repo')
+    parser.add_argument(
+        '--gcc-version', help='Use a specific GCC version')
+    parser.add_argument(
+        '--linux-git', default='linux', help='Local Linux Kernel git repo')
+    parser.add_argument(
+        '--linux-version', help='Build a specific Linux Kernel version')
+    parser.add_argument(
+        '--linux-config', help='Use a specific Linux Kernel .config file')
+    args = parser.parse_args()
+    host: Optional[str] = args.host
+    gcc_version: Optional[str] = args.gcc_version
+    linux_version: Optional[str] = args.linux_version
+    kallsyms: List[Tuple[int, str]] = []
+    if args.like is not None:
+        with open(args.like, 'rb') as fp:
+            vmlinux_bytes = fp.read()
+        if host is None:
+            elf = ELFFile(io.BytesIO(vmlinux_bytes))
+            host = get_elf_host(elf.header)
+            logging.info('Detected host: %s', host)
+        if gcc_version is None or linux_version is None:
+            m = re.search(
+                pattern=br'Linux version ([0-9.]+).*\(gcc version ([0-9.]+)',
+                string=vmlinux_bytes,
+                flags=re.MULTILINE,
+            )
+            if m is None:
+                raise Exception('Could not detect GCC / Linux Kernel version')
+            if gcc_version is None:
+                gcc_version = m.group(2).decode()
+                logging.info('Detected GCC version: %s', gcc_version)
+            if linux_version is None:
+                linux_version = m.group(1).decode()
+                logging.info(
+                    'Detected Linux Kernel version: %s', linux_version)
+        kallsyms = list(find_kallsyms_in_rodata(vmlinux_bytes))
+        logging.info('Found kallsyms: %d', len(kallsyms))
+    if host is None:
+        raise Exception('Use --like or --host to specify architecture')
+    if linux_version is None:
+        raise Exception(
+            'Use --like or --linux-version to specify a Linux Kernel version')
+    if gcc_version is None:
+        raise Exception('Use --like or --gcc-version to specify a GCC version')
+    toolchain_bin = build_or_reuse_toolchain(
+        binutils_git=Path(args.binutils_git).expanduser(),
+        binutils_version=args.binutils_version,
+        gcc_git=Path(args.gcc_git).expanduser(),
+        gcc_version=gcc_version,
+        host=host,
+    )
+    linux_config = args.linux_config
+    if linux_config is not None:
+        linux_config = Path(linux_config)
+    output = args.like
+    if output is not None:
+        output = Path(f'{output}.like')
+    vmlinux = build_or_reuse_vmlinux(
+        output=output,
+        git=Path(args.linux_git).expanduser(),
+        host=host,
+        version=linux_version,
+        linux_config=linux_config,
+        toolchain_bin=toolchain_bin,
+    )
+    logging.info('Built: %s', vmlinux)
+    if args.like is not None and len(kallsyms) > 0:
+        output = Path(f'{args.like}.like.json')
+        extract_debug_info(
+            output=output,
+            vmlinux=vmlinux,
+            kallsyms=[kallsym for _, kallsym in kallsyms],
+        )
+        logging.info('Extracted: %s', output)
+
+
+if __name__ == '__main__':
+    main()
