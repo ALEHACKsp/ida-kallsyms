@@ -64,7 +64,9 @@ def prepare_worktree(worktree: Path, git: Path, remote: str, tag: str) -> None:
     except FileNotFoundError:
         pass
     subprocess.check_call(
-        ['git', 'worktree', 'add', '-f', '--detach', worktree, tag], cwd=git)
+        ['git', 'worktree', 'add', '-f', '-f', '--detach', worktree, tag],
+        cwd=git,
+    )
 
 
 def build_or_reuse_toolchain(
@@ -74,38 +76,43 @@ def build_or_reuse_toolchain(
         gcc_version: str,
         host: str,
 ) -> Path:
-    gcc = f'{host}-gcc-{gcc_version}'
-    install = Path.cwd() / gcc
+    if binutils_version is None:
+        binutils_version = '2.27'
+    toolchain = f'{host}-toolchain-{binutils_version}-{gcc_version}'
+    install = Path.cwd() / toolchain
     bin = install / 'bin'
-    if (bin / gcc).exists():
+    if (bin / 'gcc').exists():
         return bin
-    worktree = Path.cwd() / f'{gcc}-build'
+    worktree = Path.cwd() / f'{toolchain}-build'
+    binutils_worktree = worktree / 'binutils-gdb'
     prepare_worktree(
-        worktree=worktree,
+        worktree=binutils_worktree,
+        git=binutils_git,
+        remote='git://sourceware.org/git/binutils-gdb.git',
+        tag='refs/tags/binutils-' + binutils_version.replace('.', '_'),
+    )
+    subprocess.check_call([
+        './configure',
+        f'--target={host}',
+        '--disable-multilib',
+        '--disable-nls',
+        f'--prefix={install}',
+    ], cwd=binutils_worktree, env={**os.environ, 'CXXFLAGS': '-fpermissive'})
+    for target in ('all', 'install'):
+        subprocess.check_call([
+            'make',
+            f'-j{cpu_count()}',
+            f'{target}-binutils',
+            f'{target}-gas',
+            f'{target}-ld',
+        ], cwd=binutils_worktree)
+    gcc_worktree = worktree / 'gcc'
+    prepare_worktree(
+        worktree=gcc_worktree,
         git=gcc_git,
         remote='git://gcc.gnu.org/git/gcc.git',
         tag=f'refs/tags/releases/gcc-{gcc_version}',
     )
-    if binutils_version is None:
-        binutils_version = '2.27'
-    binutils_tag = 'refs/tags/binutils-' + binutils_version.replace('.', '_')
-    fetch_tag(
-        git=binutils_git,
-        remote='git://sourceware.org/git/binutils-gdb.git',
-        tag=binutils_tag,
-    )
-    p = subprocess.Popen(
-        args=['git', 'archive', binutils_tag],
-        stdout=subprocess.PIPE,
-        cwd=binutils_git,
-    )
-    subprocess.check_call(
-        args=['tar', '--skip-old-files', '-x'],
-        stdin=p.stdout,
-        cwd=worktree,
-    )
-    if p.wait() != 0:
-        raise subprocess.CalledProcessError(p.returncode, p.args)
     subprocess.check_call([
         './configure',
         f'--target={host}',
@@ -114,19 +121,13 @@ def build_or_reuse_toolchain(
         '--disable-multilib',
         '--disable-nls',
         f'--prefix={install}',
-    ], cwd=worktree, env={**os.environ, 'CXXFLAGS': '-fpermissive'})
-
-    def make(args: List[str]) -> None:
-        args = ['make', f'-j{cpu_count()}'] + args
-        subprocess.check_call(args, cwd=worktree)
-
-    make(['all-gcc'])
-    make([
-        'install-binutils',
-        'install-gas',
-        'install-gcc',
-        'install-ld',
-    ])
+    ], cwd=gcc_worktree, env={**os.environ, 'CXXFLAGS': '-fpermissive'})
+    for target in ('all', 'install'):
+        subprocess.check_call([
+            'make',
+            f'-j{cpu_count()}',
+            f'{target}-gcc',
+        ], cwd=gcc_worktree)
     shutil.rmtree(worktree)
     return bin
 
@@ -232,6 +233,7 @@ def build_or_reuse_vmlinux(
             kconf.write_config(worktree_config)
     else:
         shutil.copyfile(linux_config, worktree_config)
+        make(['olddefconfig'])
     make(['vmlinux'])
     with tempfile.TemporaryDirectory(dir=output.parent) as tempdir:
         vmlinux_tmp = Path(tempdir) / 'vmlinux'
@@ -374,7 +376,7 @@ def main():
     )
     linux_config = args.linux_config
     if linux_config is not None:
-        linux_config = Path(linux_config)
+        linux_config = Path(linux_config).expanduser()
     output = args.like
     if output is not None:
         output = Path(f'{output}.like')
