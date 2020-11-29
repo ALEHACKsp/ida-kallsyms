@@ -9,10 +9,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
-from typing import Any, Dict, Generator, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Generator, List, NamedTuple, Optional, Set, Tuple
 
+from elftools.dwarf.die import DIE  # type: ignore
 from elftools.elf.elffile import ELFFile  # type: ignore
 from kconfiglib import Kconfig  # type: ignore
 
@@ -30,6 +32,15 @@ def get_elf_host(header: Any) -> str:
         ('EM_X86_64', 'ELFCLASS64', 'ELFDATA2LSB'): 'x86_64-linux-gnu',
         ('EM_AARCH64', 'ELFCLASS64', 'ELFDATA2LSB'): 'aarch64-linux-gnu',
     }[header.e_machine, header.e_ident.EI_CLASS, header.e_ident.EI_DATA]
+
+
+def get_pe_host(machine: int) -> str:
+    return {
+        0x14c: 'i686-linux-gnu',
+        0x1c0: 'arm-linux-gnueabi',
+        0x8664: 'x86_64-linux-gnu',
+        0xaa64: 'aarch64-linux-gnu',
+    }[machine]
 
 
 def get_linux_arch(host: str) -> str:
@@ -71,17 +82,15 @@ def prepare_worktree(worktree: Path, git: Path, remote: str, tag: str) -> None:
 
 def build_or_reuse_toolchain(
         binutils_git: Path,
-        binutils_version: Optional[str],
+        binutils_version: str,
         gcc_git: Path,
         gcc_version: str,
         host: str,
 ) -> Path:
-    if binutils_version is None:
-        binutils_version = '2.27'
     toolchain = f'{host}-toolchain-{binutils_version}-{gcc_version}'
     install = Path.cwd() / toolchain
     bin = install / 'bin'
-    if (bin / 'gcc').exists():
+    if (bin / f'{host}-gcc').exists():
         return bin
     worktree = Path.cwd() / f'{toolchain}-build'
     binutils_worktree = worktree / 'binutils-gdb'
@@ -174,7 +183,8 @@ def build_or_reuse_vmlinux(
         host: str,
         version: str,
         linux_config: Optional[Path],
-        toolchain_bin: Path
+        toolchain_bin: Path,
+        template_vmlinux: Optional[Path],
 ) -> Path:
     arch = get_linux_arch(host)
     srcarch = arch2srcarch(arch)
@@ -214,8 +224,24 @@ def build_or_reuse_vmlinux(
 
     worktree_config = worktree / '.config'
     if linux_config is None:
-        make(['defconfig'])
+        if template_vmlinux is None:
+            need_defconfig = True
+        else:
+            with open(worktree_config, 'wb') as fp:
+                returncode = subprocess.call([
+                    worktree / 'scripts' / 'extract-ikconfig',
+                    template_vmlinux,
+                ], stdout=fp)
+            if returncode == 0:
+                logging.info('Extracted: %s', worktree_config)
+                make(['olddefconfig'])
+                need_defconfig = False
+            else:
+                need_defconfig = True
+        if need_defconfig:
+            make(['defconfig'])
         cc = f'{host}-gcc'
+        ld = f'{host}-ld'
         with env({
             'srctree': str(worktree),
             'ARCH': arch,
@@ -226,6 +252,7 @@ def build_or_reuse_vmlinux(
             'HOSTCXX': 'g++',
             'CC_VERSION_TEXT': cc_version_text(toolchain_bin / cc),
             'PATH': env_path,
+            'LD': ld,
         }):
             kconf = Kconfig()
             kconf.load_config(worktree_config)
@@ -242,16 +269,230 @@ def build_or_reuse_vmlinux(
     return output
 
 
+def convert_name(die: DIE) -> Optional[str]:
+    name = die.attributes.get('DW_AT_name')
+    if name is None:
+        return None
+    return name.value.decode()
+
+
+def convert_type(die: DIE) -> Optional[int]:
+    type = die.attributes.get('DW_AT_type')
+    if type is None:
+        return None
+    return die.cu.cu_offset + type.raw_value
+
+
+class Member(NamedTuple):
+    type: int
+    name: Optional[str]
+    offset: int
+
+
+def convert_member(die: DIE) -> Optional[Member]:
+    offset_attr = die.attributes.get('DW_AT_data_member_location')
+    if offset_attr is None:
+        offset = 0
+    else:
+        offset = offset_attr.value
+    type = convert_type(die)
+    if type is None:
+        return None
+    return Member(
+        type=type,
+        name=convert_name(die),
+        offset=offset,
+    )
+
+
+class Struct(NamedTuple):
+    kind: str
+    name: Optional[str]
+    size: int
+    members: List[Member]
+
+
+def convert_struct(die: DIE) -> Optional[Struct]:
+    if 'DW_AT_declaration' in die.attributes:
+        return None
+    members = []
+    for child_die in die.iter_children():
+        if child_die.tag == 'DW_TAG_member':
+            if 'DW_AT_bit_size' in child_die.attributes or \
+                    'DW_AT_bit_offset' in child_die.attributes:
+                continue
+            member = convert_member(child_die)
+            if member is None:
+                return None
+            members.append(member)
+    return Struct(
+        kind='struct' if die.tag == 'DW_TAG_structure_type' else 'union',
+        name=convert_name(die),
+        size=die.attributes['DW_AT_byte_size'].value,
+        members=members,
+    )
+
+
+class Typedef(NamedTuple):
+    kind: str
+    name: str
+    type: int
+
+
+def convert_typedef(die: DIE) -> Optional[Typedef]:
+    name = convert_name(die)
+    if name is None:
+        return None
+    type = convert_type(die)
+    if type is None:
+        return None
+    return Typedef(
+        kind='typedef',
+        name=name,
+        type=type,
+    )
+
+
+class Pointer(NamedTuple):
+    kind: str
+    type: Optional[int]
+
+
+def convert_pointer(die: DIE) -> Optional[Pointer]:
+    return Pointer(
+        kind='pointer',
+        type=convert_type(die),
+    )
+
+
+class Int(NamedTuple):
+    kind: str
+    is_signed: bool
+    size: int
+
+
+def convert_int(die: DIE) -> Optional[Int]:
+    if 'DW_AT_declaration' in die.attributes:
+        return None
+    return Int(
+        kind='base',
+        is_signed={
+            2: False,  # boolean
+            4: False,  # float
+            5: True,  # signed
+            6: True,  # signed char
+            7: False,  # unsigned
+            8: False,  # unsigned char
+        }[die.attributes['DW_AT_encoding'].value],
+        size=die.attributes['DW_AT_byte_size'].value,
+    )
+
+
+class Qualified(NamedTuple):
+    kind: str
+    type: int
+
+
+def convert_qualified(die: DIE) -> Optional[Qualified]:
+    type = convert_type(die)
+    if type is None:
+        return None
+    return Qualified(
+        kind={
+            'DW_TAG_const_type': 'const',
+            'DW_TAG_volatile_type': 'volatile',
+        }[die.tag],
+        type=type,
+    )
+
+
+class Array(NamedTuple):
+    kind: str
+    type: int
+    size: int
+
+
+def convert_array(die: DIE) -> Optional[Array]:
+    type = convert_type(die)
+    if type is None:
+        return None
+    size = None
+    for child_die in die.iter_children():
+        if child_die.tag != 'DW_TAG_subrange_type':
+            return None
+        if size is not None:
+            return None
+        if 'DW_AT_lower_bound' in child_die.attributes:
+            return None
+        upper_bound = child_die.attributes.get('DW_AT_upper_bound')
+        if upper_bound is None:
+            return None
+        size = upper_bound.value
+    if size is None:
+        return None
+    return Array(
+        kind='array',
+        type=type,
+        size=size,
+    )
+
+
 class Parameter(NamedTuple):
     type: int
     name: str
 
 
+def convert_parameter(die: DIE) -> Optional[Parameter]:
+    type = convert_type(die)
+    if type is None:
+        return None
+    name = convert_name(die)
+    if name is None:
+        return None
+    return Parameter(
+        type=type,
+        name=name,
+    )
+
+
 class Subprogram(NamedTuple):
+    kind: str
     return_type: Optional[int]
     name: str
     parameters: List[Parameter]
     has_varargs: bool
+
+
+def convert_subprogram(
+        die: DIE, kallsyms_set: Set[str]) -> Optional[Subprogram]:
+    if ('DW_AT_inline' in die.attributes or
+            'DW_AT_declaration' in die.attributes):
+        return None
+    return_type = convert_type(die)
+    if return_type is None:
+        return None
+    name = convert_name(die)
+    if name is None or name not in kallsyms_set:
+        return None
+    parameters = []
+    has_varargs = False
+    for child_die in die.iter_children():
+        if child_die.tag == 'DW_TAG_unspecified_parameters':
+            has_varargs = True
+            continue
+        if child_die.tag != 'DW_TAG_formal_parameter':
+            continue
+        parameter = convert_parameter(child_die)
+        if parameter is None:
+            return None
+        parameters.append(parameter)
+    return Subprogram(
+        kind='subprogram',
+        return_type=return_type,
+        name=name,
+        parameters=parameters,
+        has_varargs=has_varargs,
+    )
 
 
 def extract_debug_info(
@@ -259,49 +500,46 @@ def extract_debug_info(
     # Mostly copied from
     # https://github.com/mephi42/linetrace-cmd-record/blob/9769e9505cb2/linetrace-cmd-record#L179
     # https://github.com/mephi42/linetrace-cmd-record/blob/9769e9505cb2/linetrace-cmd-record#L59
+    logging.info('Extracting debug info...')
     kallsyms_set = {kallsym[1:] for kallsym in kallsyms}
-    subprograms = {}
+    tag2convertor = {
+        'DW_TAG_structure_type': convert_struct,
+        'DW_TAG_union_type': convert_struct,
+        'DW_TAG_typedef': convert_typedef,
+        'DW_TAG_pointer_type': convert_pointer,
+        'DW_TAG_base_type': convert_int,
+        'DW_TAG_enumeration_type': convert_int,
+        'DW_TAG_const_type': convert_qualified,
+        'DW_TAG_volatile_type': convert_qualified,
+        'DW_TAG_array_type': convert_array,
+        'DW_TAG_subprogram': lambda die: convert_subprogram(die, kallsyms_set),
+    }
+    items: Dict[int, Any] = {}
     with open(vmlinux, 'rb') as fp:
         elf = ELFFile(fp)
         dwarf = elf.get_dwarf_info(
             relocate_dwarf_sections=elf['e_type'] == 'ET_REL')
         for cu in dwarf.iter_CUs():
-            for die1 in cu.get_top_DIE().iter_children():
-                if die1.tag != 'DW_TAG_subprogram':
-                    continue
-                if ('DW_AT_inline' in die1.attributes or
-                        'DW_AT_declaration' in die1.attributes):
-                    continue
-                name = die1.attributes.get('DW_AT_name')
-                if name is not None:
-                    name = name.value.decode()
-                if name is None or name not in kallsyms_set:
-                    continue
-                parameters = []
-                has_varargs = False
-                for die2 in die1.iter_children():
-                    if die2.tag == 'DW_TAG_unspecified_parameters':
-                        has_varargs = True
-                        continue
-                    if die2.tag != 'DW_TAG_formal_parameter':
-                        continue
-                    parameters.append(Parameter(
-                        type=die2.attributes['DW_AT_type'].value,
-                        name=die2.attributes['DW_AT_name'].value.decode(),
-                    ))
-                return_type = die2.attributes.get('DW_AT_type')
-                if return_type is not None:
-                    return_type = return_type.value
-                subprograms[die1.offset] = Subprogram(
-                    return_type=return_type,
-                    name=name,
-                    parameters=parameters,
-                    has_varargs=has_varargs,
-                )
+            for die in cu.get_top_DIE().iter_children():
+                convertor = tag2convertor.get(die.tag)
+                if convertor is not None:
+                    item = convertor(die)
+                    if item is not None:
+                        items[die.offset] = item
+    logging.info('Saving extracted debug info...')
     with open(output, 'w') as output_fp:
-        json.dump({
-            'subprograms': subprograms,
-        }, output_fp, indent=4, separators=(',', ': '))
+        json.dump(items, output_fp, indent=4, separators=(',', ': '))
+
+
+def detect_host(vmlinux_bytes: bytes) -> str:
+    if vmlinux_bytes[:2] == b'MZ':
+        pe_offset, = struct.unpack('<I', vmlinux_bytes[0x3c:0x40])
+        if vmlinux_bytes[pe_offset:pe_offset + 4] == b'PE\0\0':
+            machine, = struct.unpack(
+                '<H', vmlinux_bytes[pe_offset + 4:pe_offset + 6])
+            return get_pe_host(machine)
+    elf = ELFFile(io.BytesIO(vmlinux_bytes))
+    return get_elf_host(elf.header)
 
 
 def main():
@@ -335,29 +573,58 @@ def main():
     host: Optional[str] = args.host
     gcc_version: Optional[str] = args.gcc_version
     linux_version: Optional[str] = args.linux_version
+    binutils_version: Optional[str] = args.binutils_version
     kallsyms: List[Tuple[int, str]] = []
-    if args.like is not None:
+    if args.like is None:
+        template_vmlinux = None
+    else:
+        template_vmlinux = Path(args.like)
         with open(args.like, 'rb') as fp:
             vmlinux_bytes = fp.read()
         if host is None:
-            elf = ELFFile(io.BytesIO(vmlinux_bytes))
-            host = get_elf_host(elf.header)
+            host = detect_host(vmlinux_bytes)
             logging.info('Detected host: %s', host)
-        if gcc_version is None or linux_version is None:
-            m = re.search(
-                pattern=br'Linux version ([0-9.]+).*\(gcc version ([0-9.]+)',
+        if linux_version is None:
+            m_linux = re.search(
+                pattern=br'Linux version ([0-9.]+)',
                 string=vmlinux_bytes,
                 flags=re.MULTILINE,
             )
-            if m is None:
-                raise Exception('Could not detect GCC / Linux Kernel version')
-            if gcc_version is None:
-                gcc_version = m.group(2).decode()
-                logging.info('Detected GCC version: %s', gcc_version)
-            if linux_version is None:
-                linux_version = m.group(1).decode()
-                logging.info(
-                    'Detected Linux Kernel version: %s', linux_version)
+            if m_linux is None:
+                raise Exception('Could not detect Linux Kernel version')
+            linux_version = m_linux.group(1).decode()
+            if linux_version.endswith('.0'):
+                linux_version = linux_version[:-2]
+            logging.info(
+                'Detected Linux Kernel version: %s', linux_version)
+        if gcc_version is None:
+            m_gcc = re.search(
+                pattern=br'\(gcc version ([0-9.]+)',
+                string=vmlinux_bytes,
+                flags=re.MULTILINE,
+            )
+            if m_gcc is None:
+                m_gcc = re.search(
+                    pattern=br'\(gcc \(Ubuntu [^ ]+\) ([0-9.]+)',
+                    string=vmlinux_bytes,
+                    flags=re.MULTILINE,
+                )
+            if m_gcc is None:
+                raise Exception('Could not detect GCC version')
+            gcc_version = m_gcc.group(1).decode()
+            logging.info('Detected GCC version: %s', gcc_version)
+        if binutils_version is None:
+            m_binutils = re.search(
+                pattern=br'GNU ld \(GNU Binutils for Ubuntu\) ([0-9.]+)',
+                string=vmlinux_bytes,
+                flags=re.MULTILINE,
+            )
+            if m_binutils is None:
+                binutils_version = '2.32'
+                logging.info('Assuming binutils version: %s', binutils_version)
+            else:
+                binutils_version = m_binutils.group(1).decode()
+                logging.info('Detected binutils version: %s', binutils_version)
         kallsyms = list(find_kallsyms_in_rodata(vmlinux_bytes))
         logging.info('Found kallsyms: %d', len(kallsyms))
     if host is None:
@@ -369,7 +636,7 @@ def main():
         raise Exception('Use --like or --gcc-version to specify a GCC version')
     toolchain_bin = build_or_reuse_toolchain(
         binutils_git=Path(args.binutils_git).expanduser(),
-        binutils_version=args.binutils_version,
+        binutils_version=binutils_version,
         gcc_git=Path(args.gcc_git).expanduser(),
         gcc_version=gcc_version,
         host=host,
@@ -387,6 +654,7 @@ def main():
         version=linux_version,
         linux_config=linux_config,
         toolchain_bin=toolchain_bin,
+        template_vmlinux=template_vmlinux,
     )
     logging.info('Built: %s', vmlinux)
     if args.like is not None and len(kallsyms) > 0:
